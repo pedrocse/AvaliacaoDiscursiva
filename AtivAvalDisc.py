@@ -20,6 +20,7 @@ from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.shared import Inches, Pt
 from psycopg2.extras import Json, RealDictCursor
+from supabase import Client, create_client
 
 
 # ============================================================
@@ -93,6 +94,10 @@ SMTP_USER = os.getenv("SMTP_USER") or get_secret("SMTP_USER", "")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD") or get_secret("SMTP_PASSWORD", "")
 SMTP_FROM = os.getenv("SMTP_FROM") or get_secret("SMTP_FROM", SMTP_USER)
 
+SUPABASE_URL = get_secret("SUPABASE_URL", None) or os.getenv("SUPABASE_URL") or ""
+SUPABASE_KEY = get_secret("SUPABASE_KEY", None) or os.getenv("SUPABASE_KEY") or ""
+SUPABASE_STORAGE_BUCKET = get_secret("SUPABASE_STORAGE_BUCKET", None) or os.getenv("SUPABASE_STORAGE_BUCKET") or ""
+
 # Neste app local, o arquivo .streamlit/secrets.toml tem prioridade.
 # Assim, variáveis antigas do Windows usadas para Supabase não sobrescrevem a configuração local.
 PGHOST = get_secret("PGHOST", None) or os.getenv("PGHOST") or "localhost"
@@ -100,6 +105,7 @@ PGPORT = int(get_secret("PGPORT", None) or os.getenv("PGPORT") or 5432)
 PGDATABASE = get_secret("PGDATABASE", None) or os.getenv("PGDATABASE") or "avaliacao_discursiva"
 PGUSER = get_secret("PGUSER", None) or os.getenv("PGUSER") or "postgres"
 PGPASSWORD = get_secret("PGPASSWORD", None) or os.getenv("PGPASSWORD") or ""
+PGSSLMODE = get_secret("PGSSLMODE", None) or os.getenv("PGSSLMODE") or "prefer"
 
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD") or get_secret("ADMIN_PASSWORD", "")
 
@@ -144,6 +150,89 @@ def has_supported_image_signature(file_bytes: bytes) -> bool:
     return file_bytes.startswith(b"\x89PNG\r\n\x1a\n") or file_bytes.startswith(b"\xff\xd8")
 
 
+def storage_is_configured() -> bool:
+    return bool(SUPABASE_URL and SUPABASE_KEY and SUPABASE_STORAGE_BUCKET)
+
+
+def storage_status_summary() -> dict:
+    return {
+        "SUPABASE_URL": "configurado" if bool(SUPABASE_URL) else "ausente",
+        "SUPABASE_KEY": "configurado" if bool(SUPABASE_KEY) else "ausente",
+        "SUPABASE_STORAGE_BUCKET": SUPABASE_STORAGE_BUCKET or "ausente",
+        "storage_ativo": "sim" if storage_is_configured() else "não",
+    }
+
+
+def get_supabase_client() -> Client:
+    return create_client(SUPABASE_URL, SUPABASE_KEY)
+
+
+def upload_bytes_to_storage(storage_path: str, file_bytes: bytes, content_type: str, upsert: bool = True) -> None:
+    supabase = get_supabase_client()
+    supabase.storage.from_(SUPABASE_STORAGE_BUCKET).upload(
+        path=storage_path,
+        file=file_bytes,
+        file_options={
+            "content-type": content_type,
+            "upsert": "true" if upsert else "false",
+        },
+    )
+
+
+def download_bytes_from_storage(storage_path: str) -> bytes:
+    supabase = get_supabase_client()
+    data = supabase.storage.from_(SUPABASE_STORAGE_BUCKET).download(storage_path)
+    if not isinstance(data, (bytes, bytearray)):
+        raise TypeError(f"Download retornou tipo inesperado para {storage_path}: {type(data)}")
+    return bytes(data)
+
+
+def test_storage_roundtrip() -> tuple[bool, str]:
+    if not storage_is_configured():
+        return False, "Storage não configurado: confira SUPABASE_URL, SUPABASE_KEY e SUPABASE_STORAGE_BUCKET nos Secrets do Streamlit."
+
+    test_path = f"_diagnostico/teste_{uuid.uuid4().hex[:8]}.txt"
+    payload = f"teste storage {now_str()}".encode("utf-8")
+
+    try:
+        upload_bytes_to_storage(test_path, payload, "text/plain", upsert=True)
+        downloaded = download_bytes_from_storage(test_path)
+        if downloaded != payload:
+            return False, f"Upload ocorreu, mas o download retornou conteúdo diferente: {test_path}"
+        return True, f"Upload e download OK no bucket '{SUPABASE_STORAGE_BUCKET}': {test_path}"
+    except Exception as e:
+        return False, f"Falha no teste do Storage: {e}"
+
+
+def is_storage_path(path_value: str) -> bool:
+    value = str(path_value or "").strip()
+    return value.startswith("docx/") or value.startswith("question_images/") or value.startswith("student_answers/")
+
+
+def get_file_bytes(path_value: str | Path) -> bytes:
+    path_text = str(path_value or "").strip()
+    if not path_text:
+        raise FileNotFoundError("Caminho do arquivo vazio.")
+    if is_storage_path(path_text):
+        return download_bytes_from_storage(path_text)
+    return read_file_bytes(path_text)
+
+
+def save_generated_docx(file_name: str, file_bytes: bytes, folder: str = "docx") -> str:
+    if storage_is_configured():
+        storage_path = f"{folder}/{file_name}"
+        upload_bytes_to_storage(
+            storage_path,
+            file_bytes,
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+        return storage_path
+
+    local_path = DOCX_DIR / file_name
+    local_path.write_bytes(file_bytes)
+    return str(local_path)
+
+
 def save_question_image(uploaded_file, evaluation_id: str, question_idx: int) -> tuple[str, str]:
     file_bytes = uploaded_file.getbuffer().tobytes()
     if not has_supported_image_signature(file_bytes):
@@ -152,6 +241,13 @@ def save_question_image(uploaded_file, evaluation_id: str, question_idx: int) ->
     original_name = safe_filename(uploaded_file.name or f"questao_{question_idx}.png")
     suffix = Path(original_name).suffix.lower() or ".png"
     image_name = f"{evaluation_id[:8]}_q{question_idx}_{uuid.uuid4().hex[:8]}{suffix}"
+    content_type = "image/png" if suffix == ".png" else "image/jpeg"
+
+    if storage_is_configured():
+        storage_path = f"question_images/{image_name}"
+        upload_bytes_to_storage(storage_path, file_bytes, content_type)
+        return image_name, storage_path
+
     image_path = IMAGE_DIR / image_name
     image_path.write_bytes(file_bytes)
     return image_name, str(image_path)
@@ -244,6 +340,7 @@ def db_connect():
                 dbname=PGDATABASE,
                 user=PGUSER,
                 password=PGPASSWORD,
+                sslmode=PGSSLMODE,
                 cursor_factory=RealDictCursor,
                 connect_timeout=10,
             )
@@ -451,15 +548,15 @@ def add_centered_picture_if_exists(doc: Document, image_path: Path, width: float
 def add_question_image_if_exists(doc: Document, image_path_value: str, width: float = 5.5) -> None:
     if not str(image_path_value or "").strip():
         return
-    image_path = Path(image_path_value or "")
-    if image_path.exists() and image_path.is_file():
-        try:
-            p = doc.add_paragraph()
-            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            run = p.add_run()
-            run.add_picture(str(image_path), width=Inches(width))
-        except Exception:
-            doc.add_paragraph(f"[Figura não inserida no DOCX: arquivo de imagem inválido ou incompatível - {image_path.name}]")
+    try:
+        image_bytes = get_file_bytes(image_path_value)
+        p = doc.add_paragraph()
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        run = p.add_run()
+        run.add_picture(BytesIO(image_bytes), width=Inches(width))
+    except Exception:
+        image_name = Path(str(image_path_value)).name
+        doc.add_paragraph(f"[Figura não inserida no DOCX: arquivo de imagem inválido ou incompatível - {image_name}]")
 
 
 def add_key_value_table(doc: Document, pairs: list[tuple[str, str]], cols: int = 2) -> None:
@@ -626,8 +723,11 @@ def make_zip_all(df_: pd.DataFrame) -> bytes:
             base = f"{created_txt}_{titulo}_{(protocolo or '')[:8]}".strip("_")
             docxp = r.get("docx_path", "")
 
-            if docxp and Path(docxp).exists():
-                z.writestr(f"DOCX/{base}.docx", read_file_bytes(docxp))
+            if docxp:
+                try:
+                    z.writestr(f"DOCX/{base}.docx", get_file_bytes(docxp))
+                except Exception as e:
+                    z.writestr(f"DOCX/ERRO_{base}.txt", f"Erro ao obter DOCX ({docxp}): {e}".encode("utf-8"))
             else:
                 z.writestr(f"DOCX/NAO_ENCONTRADO_{base}.txt", f"DOCX não encontrado: {docxp}".encode("utf-8"))
 
@@ -919,9 +1019,9 @@ def render_student_page():
         st.markdown(f"### Questão {idx}")
         st.caption(f"Taxonomia: {questao.get('taxonomia', '')} | Valor: {questao.get('valor', '')}")
         st.write(questao.get("enunciado", ""))
-        if questao.get("image_path") and Path(questao["image_path"]).exists():
+        if questao.get("image_path"):
             try:
-                st.image(questao["image_path"], caption=f"Figura da questão {idx}", use_container_width=True)
+                st.image(get_file_bytes(questao["image_path"]), caption=f"Figura da questão {idx}", use_container_width=True)
             except Exception:
                 st.warning(f"A figura da questão {idx} não pôde ser exibida.")
         resposta = st.text_area("Resposta", key=f"student_resposta_{idx}", height=220)
@@ -949,9 +1049,8 @@ def render_student_page():
         now = datetime.now()
         now_fmt = now.strftime("%Y-%m-%d %H:%M:%S")
         docx_name = f"{now_fmt[:10]}_{safe_slug(student['email_aluno'])}_{safe_slug(evaluation['titulo'])}_{answer_id[:8]}.docx"
-        docx_path = DOCX_DIR / docx_name
         docx_bytes = make_student_answer_docx_bytes(evaluation, student, respostas, now_fmt, answer_id)
-        docx_path.write_bytes(docx_bytes)
+        docx_path = save_generated_docx(docx_name, docx_bytes, folder="student_answers")
 
         row = {
             "id": answer_id,
@@ -963,7 +1062,7 @@ def render_student_page():
             "email_aluno": student["email_aluno"].strip(),
             "respostas": Json(respostas),
             "docx_filename": docx_name,
-            "docx_path": str(docx_path),
+            "docx_path": docx_path,
             "status": "ENVIADA",
             "observacao_admin": "",
         }
@@ -1024,9 +1123,9 @@ def render_answer_comparison(answer_row: dict) -> None:
         with st.expander(f"Questão {idx} | Taxonomia: {questao.get('taxonomia', '')} | Valor: {questao.get('valor', '')}", expanded=idx == 1):
             st.markdown("**Enunciado**")
             st.write(questao.get("enunciado", ""))
-            if questao.get("image_path") and Path(questao["image_path"]).exists():
+            if questao.get("image_path"):
                 try:
-                    st.image(questao["image_path"], caption=f"Figura da questão {idx}", use_container_width=True)
+                    st.image(get_file_bytes(questao["image_path"]), caption=f"Figura da questão {idx}", use_container_width=True)
                 except Exception:
                     st.warning("A figura desta questão não pôde ser exibida.")
 
@@ -1146,9 +1245,8 @@ def main():
             fields["questoes"] = questoes_para_salvar
 
             docx_name = f"{now_fmt[:10]}_{safe_slug(fields['email_docente'])}_{safe_slug(fields['titulo'])}_{sub_id[:8]}.docx"
-            docx_path = DOCX_DIR / docx_name
             docx_bytes = make_docx_bytes(fields, created_at=now_fmt, sub_id=sub_id, status=status)
-            docx_path.write_bytes(docx_bytes)
+            docx_path = save_generated_docx(docx_name, docx_bytes, folder="docx")
 
             row = {
                 "id": sub_id,
@@ -1168,7 +1266,7 @@ def main():
                 "access_code": access_code,
                 "questoes": Json(fields["questoes"]),
                 "docx_filename": docx_name,
-                "docx_path": str(docx_path),
+                "docx_path": docx_path,
                 "status": status,
                 "observacao_admin": "",
             }
@@ -1227,6 +1325,20 @@ def main():
         if st.button("Sair do Admin"):
             st.session_state.admin_authed = False
             st.rerun()
+
+        with st.expander("Diagnóstico do Supabase Storage"):
+            summary = storage_status_summary()
+            st.write(f"**SUPABASE_URL:** {summary['SUPABASE_URL']}")
+            st.write(f"**SUPABASE_KEY:** {summary['SUPABASE_KEY']}")
+            st.write(f"**SUPABASE_STORAGE_BUCKET:** {summary['SUPABASE_STORAGE_BUCKET']}")
+            st.write(f"**Storage ativo:** {summary['storage_ativo']}")
+
+            if st.button("Testar upload no Storage"):
+                ok, message = test_storage_roundtrip()
+                if ok:
+                    st.success(message)
+                else:
+                    st.error(message)
 
         df = db_list()
 
@@ -1344,14 +1456,17 @@ def main():
             st.write(f"**Avaliação:** {answer_row['titulo']}")
             st.write(f"**Código:** {answer_row['access_code']}")
 
-            if answer_row.get("docx_path") and Path(answer_row["docx_path"]).exists():
-                st.download_button(
-                    "Baixar resposta DOCX",
-                    data=read_file_bytes(answer_row["docx_path"]),
-                    file_name=safe_filename(answer_row["docx_filename"]),
-                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                    key=f"download_answer_docx_{answer_row['id']}",
-                )
+            if answer_row.get("docx_path"):
+                try:
+                    st.download_button(
+                        "Baixar resposta DOCX",
+                        data=get_file_bytes(answer_row["docx_path"]),
+                        file_name=safe_filename(answer_row["docx_filename"]),
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        key=f"download_answer_docx_{answer_row['id']}",
+                    )
+                except Exception as e:
+                    st.warning(f"DOCX da resposta não encontrado: {e}")
             else:
                 st.warning("DOCX da resposta não encontrado.")
 
@@ -1387,16 +1502,19 @@ def main():
         if (row.get("observacao_admin") or "").strip():
             st.write(f"**Observação atual:** {row['observacao_admin']}")
 
-        if row.get("docx_path") and Path(row["docx_path"]).exists():
-            st.download_button(
-                "Baixar DOCX",
-                data=read_file_bytes(row["docx_path"]),
-                file_name=safe_filename(row["docx_filename"]),
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                key=f"download_docx_{row['id']}",
-            )
+        if row.get("docx_path"):
+            try:
+                st.download_button(
+                    "Baixar DOCX",
+                    data=get_file_bytes(row["docx_path"]),
+                    file_name=safe_filename(row["docx_filename"]),
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    key=f"download_docx_{row['id']}",
+                )
+            except Exception as e:
+                st.warning(f"DOCX não encontrado: {e}")
         else:
-            st.warning("DOCX local não encontrado.")
+            st.warning("DOCX não encontrado.")
 
         st.markdown("#### Atualizar status")
         novo_status = st.selectbox(
