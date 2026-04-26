@@ -575,6 +575,27 @@ def add_response_lines(doc: Document, total: int) -> None:
         doc.add_paragraph(f"{i} " + "_" * 86)
 
 
+def add_exam_instructions_to_doc(doc: Document, valor_total: str) -> None:
+    doc.add_paragraph()
+    doc.add_heading("ANTES DE INICIAR A PROVA LEIA ATENTAMENTE AS INSTRUÇÕES ABAIXO", level=2)
+    for item in INSTRUCOES_PROVA:
+        doc.add_paragraph(item, style="List Bullet")
+    doc.add_paragraph(
+        f"O valor total da prova é de {valor_total or '8,0'}. "
+        "A1 e A2: mínimo de 6,0 e máximo de 8,0 pontos. Na A3 o valor deve ser de 10 pontos."
+    )
+
+
+def render_exam_instructions(valor_total: str) -> None:
+    st.markdown("### ANTES DE INICIAR A PROVA LEIA ATENTAMENTE AS INSTRUÇÕES ABAIXO")
+    for item in INSTRUCOES_PROVA:
+        st.markdown(f"- {item}")
+    st.write(
+        f"O valor total da prova é de {valor_total or '8,0'}. "
+        "A1 e A2: mínimo de 6,0 e máximo de 8,0 pontos. Na A3 o valor deve ser de 10 pontos."
+    )
+
+
 def make_docx_bytes(fields: dict, created_at: str, sub_id: str, status: str) -> bytes:
     doc = Document()
     set_default_font(doc)
@@ -600,15 +621,7 @@ def make_docx_bytes(fields: dict, created_at: str, sub_id: str, status: str) -> 
         ],
     )
 
-    doc.add_paragraph()
-    doc.add_heading("ANTES DE INICIAR A PROVA LEIA ATENTAMENTE AS INSTRUÇÕES ABAIXO", level=2)
-    for item in INSTRUCOES_PROVA:
-        doc.add_paragraph(item, style="List Bullet")
-    doc.add_paragraph(
-        "O valor total da prova é de "
-        f"{fields.get('valor_total', '')}. "
-        "A1 e A2: mínimo de 6,0 e máximo de 8,0 pontos. Na A3 o valor deve ser de 10 pontos."
-    )
+    add_exam_instructions_to_doc(doc, fields.get("valor_total", ""))
 
     for idx, questao in enumerate(fields["questoes"], start=1):
         doc.add_page_break()
@@ -677,6 +690,8 @@ def make_student_answer_docx_bytes(evaluation: dict, student: dict, respostas: l
             ("Código", evaluation.get("access_code", "")),
         ],
     )
+
+    add_exam_instructions_to_doc(doc, str(evaluation.get("valor_total", "")))
 
     questoes = evaluation.get("questoes") or []
     for idx, resposta in enumerate(respostas, start=1):
@@ -1012,6 +1027,8 @@ def render_student_page():
     with col2:
         email_aluno = st.text_input("E-mail do aluno", key="student_email_aluno")
 
+    st.divider()
+    render_exam_instructions(str(evaluation.get("valor_total", "")))
     st.divider()
     questoes = evaluation.get("questoes") or []
     respostas = []
